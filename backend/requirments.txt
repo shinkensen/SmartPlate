@@ -1,0 +1,7 @@
+fastapi
+pydantic
+python-dotenv
+Pillow
+torch
+[torchvision](guide://action?prefill=Tell%20me%20more%20about%3A%20torchvision)
+[supabase](guide://action?prefill=Tell%20me%20more%20about%3A%20supabase)
