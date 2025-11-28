@@ -101,7 +101,7 @@ function logoutBtn(){
     const isLoggedIn = localStorage.getItem('isLoggedIn');
     if (isLoggedIn){
         const navigate = document.getElementById('logoutBtn');
-        if(navigate && ){
+        if(navigate && !document.getElementById('logoutBtn')){
 
         }
     }
