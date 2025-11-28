@@ -11,7 +11,10 @@ import torch
 import torchvision.transforms as T
 from supabase import create_client, Client
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+import aiohttp
+import asyncio
+import openfoodfacts
 
 # Initialize Supabase client
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -26,7 +29,6 @@ app = FastAPI(title="SmartPlate CV Service")
 class DetectRequest(BaseModel):
     user_id: str
     bucket: Optional[str] = "fridge-images"
-
 
 # COCO class names (index 0 is __background__)
 COCO_INSTANCE_CATEGORY_NAMES = [
@@ -48,17 +50,167 @@ FOOD_CLASSES = set([
     'bottle', 'wine glass', 'cup', 'bowl', 'cake'
 ])
 
-def save_ingredients_to_supabase(user_id: str, ingredients: list, file_name: str):
+# Open Food Facts product mapping
+FOOD_TO_PRODUCT_CATEGORIES = {
+    'banana': 'bananas',
+    'apple': 'apples',
+    'orange': 'oranges',
+    'broccoli': 'broccoli',
+    'carrot': 'carrots',
+    'pizza': 'pizzas',
+    'donut': 'donuts',
+    'sandwich': 'sandwiches',
+    'hot dog': 'hot-dogs',
+    'bottle': 'waters',
+    'wine glass': 'wines',
+    'cup': 'milks',
+    'bowl': 'soups',
+    'cake': 'cakes'
+}
+
+# Average shelf life in days (fallback if Open Food Facts doesn't have data)
+DEFAULT_SHELF_LIFE = {
+    'banana': 7,
+    'apple': 30,
+    'orange': 14,
+    'broccoli': 7,
+    'carrot': 21,
+    'pizza': 3,
+    'donut': 2,
+    'sandwich': 2,
+    'hot dog': 7,
+    'bottle': 365,
+    'wine glass': 1095,
+    'cup': 7,
+    'bowl': 3,
+    'cake': 5
+}
+
+async def get_food_facts_info(food_item: str):
+    """Get product information from Open Food Facts API"""
+    try:
+        category = FOOD_TO_PRODUCT_CATEGORIES.get(food_item, food_item)
+        api = openfoodfacts.API(user_agent="SmartPlate/1.0")
+        
+        search_results = api.product.text_search(category, page_size=5)
+        
+        if search_results.get('products'):
+            for product in search_results['products']:
+                expiration_info = extract_expiration_info(product)
+                if expiration_info:
+                    return {
+                        'food_item': food_item,
+                        'product_name': product.get('product_name', 'Unknown'),
+                        'brand': product.get('brands', 'Unknown'),
+                        'expiration_info': expiration_info,
+                        'status': 'success',
+                        'source': 'openfoodfacts'
+                    }
+        
+        # Fallback to default shelf life
+        return {
+            'food_item': food_item,
+            'product_name': food_item.title(),
+            'expiration_info': {
+                'shelf_life_days': DEFAULT_SHELF_LIFE.get(food_item, 7),
+                'storage_advice': 'Store in cool, dry place',
+                'is_estimated': True
+            },
+            'status': 'estimated',
+            'source': 'default'
+        }
+        
+    except Exception as e:
+        return {
+            'food_item': food_item,
+            'product_name': food_item.title(),
+            'expiration_info': {
+                'shelf_life_days': DEFAULT_SHELF_LIFE.get(food_item, 7),
+                'storage_advice': 'Store in cool, dry place',
+                'is_estimated': True,
+                'error': str(e)
+            },
+            'status': 'fallback',
+            'source': 'default'
+        }
+
+def extract_expiration_info(product: dict) -> dict:
+    """Extract expiration information from product data"""
+    expiration_info = {}
+    
+    if product.get('expiration_date'):
+        expiration_info['expiration_date'] = product['expiration_date']
+    
+    if product.get('best_before_date'):
+        expiration_info['best_before_date'] = product['best_before_date']
+    
+    expiration_info['shelf_life_days'] = estimate_shelf_life(product)
+    expiration_info['storage_advice'] = get_storage_advice(product)
+    expiration_info['is_estimated'] = True
+    
+    return expiration_info
+
+def estimate_shelf_life(product: dict) -> int:
+    """Estimate shelf life based on product characteristics"""
+    product_name = product.get('product_name', '').lower()
+    categories = product.get('categories', '').lower()
+    
+    if any(word in categories for word in ['dairy', 'milk', 'yogurt', 'cheese']):
+        return 7
+    elif any(word in categories for word in ['meat', 'poultry', 'fish', 'seafood']):
+        return 3
+    elif any(word in categories for word in ['bread', 'bakery', 'pastry']):
+        return 5
+    elif any(word in categories for word in ['fruit', 'vegetable', 'produce']):
+        return 14
+    elif any(word in categories for word in ['canned', 'preserved', 'jar']):
+        return 365
+    else:
+        return 30
+
+def get_storage_advice(product: dict) -> str:
+    """Get appropriate storage advice based on product type"""
+    categories = product.get('categories', '').lower()
+    
+    if any(word in categories for word in ['dairy', 'milk', 'yogurt']):
+        return 'Refrigerate at 4°C or below'
+    elif any(word in categories for word in ['meat', 'poultry', 'fish']):
+        return 'Refrigerate at 4°C or below, use within 3 days'
+    elif any(word in categories for word in ['fruit', 'vegetable']):
+        return 'Store in refrigerator crisper drawer'
+    elif any(word in categories for word in ['bread', 'bakery']):
+        return 'Store in cool, dry place or freeze to extend freshness'
+    else:
+        return 'Store in cool, dry place away from direct sunlight'
+
+def calculate_expiration_date(shelf_life_days: int) -> dict:
+    """Calculate expiration date based on shelf life"""
+    from datetime import timedelta
+    
+    current_date = datetime.now(timezone.utc)
+    expiration_date = current_date + timedelta(days=shelf_life_days)
+    
+    return {
+        'shelf_life_days': shelf_life_days,
+        'purchase_date': current_date.isoformat(),
+        'expiration_date': expiration_date.isoformat(),
+        'days_until_expiry': shelf_life_days
+    }
+
+def save_ingredients_to_supabase(user_id: str, ingredients: list, file_name: str, expiration_data: dict = None):
     """Save detected ingredients to Supabase detected_ingredients table"""
     try:
-        # Convert ingredients list to JSON string for storage
-        ingredients_json = json.dumps(ingredients)
+        ingredients_count = len(ingredients)
+        detection_confidence = max([ingredient.get('score', 0) for ingredient in ingredients]) if ingredients else 0
         
         data = {
             'user_id': user_id,
-            'ingredients': ingredients_json,
+            'ingredients': json.dumps(ingredients),
             'image_file': file_name,
-            'detected_at': datetime.utcnow().isoformat()
+            'expiration_data': json.dumps(expiration_data) if expiration_data else None,
+            'detection_confidence': float(detection_confidence),
+            'ingredients_count': ingredients_count,
+            'detected_at': datetime.now(timezone.utc).isoformat()
         }
         
         response = supabase.table('detected_ingredients').insert(data).execute()
@@ -73,10 +225,8 @@ def save_ingredients_to_supabase(user_id: str, ingredients: list, file_name: str
 def list_user_files(bucket: str, user_id: str):
     """List files under a user's top-level folder. Returns list of file metadata dicts."""
     try:
-        # Try listing with path if supported
         res = supabase.storage.from_(bucket).list(path=user_id)
     except Exception:
-        # Fallback: list all and filter by prefix
         res = supabase.storage.from_(bucket).list()
         if isinstance(res, list):
             res = [f for f in res if f.get('name','').startswith(f"{user_id}/")]
@@ -84,27 +234,22 @@ def list_user_files(bucket: str, user_id: str):
     if not res:
         return []
 
-    # Ensure items have created_at; sort descending
     try:
         files = sorted(res, key=lambda x: x.get('created_at', ''), reverse=True)
     except Exception:
         files = res
     return files
 
-
 def download_file_bytes(bucket: str, file_name: str) -> bytes:
     """Download file bytes from Supabase storage. Returns bytes."""
     data = supabase.storage.from_(bucket).download(file_name)
-    # supabase-py may return bytes or a requests.Response-like object
     if hasattr(data, 'read'):
         return data.read()
     if isinstance(data, (bytes, bytearray)):
         return bytes(data)
-    # If it's a dict with 'content' key
     if isinstance(data, dict) and 'content' in data:
         return data['content']
     raise RuntimeError('Unsupported download response type from Supabase')
-
 
 @app.post('/detect')
 async def detect(req: DetectRequest):
@@ -167,14 +312,46 @@ async def detect(req: DetectRequest):
 
     ingredients = [{'name': k, 'score': v} for k, v in sorted(result_map.items(), key=lambda x: -x[1])]
 
-    # Save to Supabase detected_ingredients table
-    save_success = save_ingredients_to_supabase(user_id, ingredients, file_name)
+    # Get expiration information for detected ingredients
+    expiration_results = {}
+    if ingredients:
+        tasks = [get_food_facts_info(ingredient['name']) for ingredient in ingredients]
+        expiration_responses = await asyncio.gather(*tasks)
+        
+        for response in expiration_responses:
+            expiration_results[response['food_item']] = response
+
+    # Enhance ingredients with expiration data
+    enhanced_ingredients = []
+    for ingredient in ingredients:
+        enhanced_ingredient = ingredient.copy()
+        expiration_info = expiration_results.get(ingredient['name'], {})
+        
+        if expiration_info.get('expiration_info', {}).get('shelf_life_days'):
+            shelf_life = expiration_info['expiration_info']['shelf_life_days']
+            expiration_dates = calculate_expiration_date(shelf_life)
+            expiration_info['expiration_info']['dates'] = expiration_dates
+        
+        enhanced_ingredient['expiration_info'] = expiration_info
+        enhanced_ingredients.append(enhanced_ingredient)
+
+    # Save to Supabase
+    save_success = save_ingredients_to_supabase(user_id, enhanced_ingredients, file_name, expiration_results)
     
     return {
         'file': file_name,
-        'ingredients': ingredients,
+        'ingredients': enhanced_ingredients,
         'saved_to_supabase': save_success
     }
+
+@app.get('/expiration-info/{food_item}')
+async def get_expiration_info(food_item: str):
+    """Get expiration information for a specific food item"""
+    try:
+        expiration_info = await get_food_facts_info(food_item)
+        return expiration_info
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Failed to fetch expiration info: {e}')
 
 @app.get('/user-ingredients/{user_id}')
 async def get_user_ingredients(user_id: str):
@@ -191,10 +368,11 @@ async def get_user_ingredients(user_id: str):
             
         results = response.data if hasattr(response, 'data') else []
         
-        # Parse JSON ingredients back to objects
         for result in results:
             if 'ingredients' in result and isinstance(result['ingredients'], str):
                 result['ingredients'] = json.loads(result['ingredients'])
+            if 'expiration_data' in result and isinstance(result['expiration_data'], str):
+                result['expiration_data'] = json.loads(result['expiration_data'])
                 
         return results
     except Exception as e:
@@ -214,17 +392,25 @@ async def get_all_ingredients():
             
         results = response.data if hasattr(response, 'data') else []
         
-        # Parse JSON ingredients back to objects
         for result in results:
             if 'ingredients' in result and isinstance(result['ingredients'], str):
                 result['ingredients'] = json.loads(result['ingredients'])
+            if 'expiration_data' in result and isinstance(result['expiration_data'], str):
+                result['expiration_data'] = json.loads(result['expiration_data'])
                 
         return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Failed to fetch all ingredients: {e}')
 
+@app.get('/health')
+async def health_check():
+    """Health check endpoint"""
+    return {
+        'status': 'healthy',
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'service': 'SmartPlate CV Service'
+    }
+
 if __name__ == '__main__':
+    import uvicorn
     uvicorn.run('cv:app', host='0.0.0.0', port=8001, reload=True)
-    
-    
-#API URL https://smartplate-xics.onrender.com
