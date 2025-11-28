@@ -44,7 +44,7 @@ async function auth(req, res, next) {
         return res.status(401).json({ error: err.message });
     }
 }
-conn.post('uploadImage',auth,async(req,res)=>{
+conn.post('/uploadImage',auth,async(req,res)=>{
     try{
         const uuid= req.userId;
         const file = req.file;
@@ -74,14 +74,13 @@ conn.post('uploadImage',auth,async(req,res)=>{
                 user_id: userId,
                 bucket: "user-images"
             })
-            });
-            if (!response.ok) {
-                throw new Error(`Error ${response.status}: ${await response.text()}`);
-            }
-            const data1 = await response.json();
-            console.log("Detection result:", data1);
-            // Example call
-            res.status(200).json({})
+        });
+        if (!response.ok) {
+            throw new Error(`Error ${response.status}: ${await response.text()}`);
+        }
+        const data1 = await response.json();
+        console.log("Detection result:", data1);
+        return res.status(200).json(data1.ingredients)
     }
     catch (e){
         res.status(500).json({error: e.message});
