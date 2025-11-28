@@ -10,10 +10,8 @@ from PIL import Image
 import torch
 import torchvision.transforms as T
 from supabase import create_client, Client
-
-import sqlite3
 import json
-import uvicorn
+from datetime import datetime
 
 # Initialize Supabase client
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -24,24 +22,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="SmartPlate CV Service")
-
-# Initialize SQLite database
-def init_db():
-    conn = sqlite3.connect('food_nutrition.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS recipes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            ingredients TEXT NOT NULL,
-            detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-# Initialize database when app starts
-init_db()
 
 class DetectRequest(BaseModel):
     user_id: str
@@ -68,24 +48,26 @@ FOOD_CLASSES = set([
     'bottle', 'wine glass', 'cup', 'bowl', 'cake'
 ])
 
-def save_ingredients_to_db(user_id: str, ingredients: list):
-    """Save detected ingredients to SQLite database"""
+def save_ingredients_to_supabase(user_id: str, ingredients: list, file_name: str):
+    """Save detected ingredients to Supabase detected_ingredients table"""
     try:
-        conn = sqlite3.connect('food_nutrition.db')
-        cursor = conn.cursor()
-        
-        # Convert ingredients list to JSON string
+        # Convert ingredients list to JSON string for storage
         ingredients_json = json.dumps(ingredients)
         
-        cursor.execute(
-            'INSERT INTO recipes (user_id, ingredients) VALUES (?, ?)',
-            (user_id, ingredients_json)
-        )
-        conn.commit()
-        conn.close()
+        data = {
+            'user_id': user_id,
+            'ingredients': ingredients_json,
+            'image_file': file_name,
+            'detected_at': datetime.utcnow().isoformat()
+        }
+        
+        response = supabase.table('detected_ingredients').insert(data).execute()
+        
+        if hasattr(response, 'error') and response.error:
+            raise Exception(response.error)
         return True
     except Exception as e:
-        print(f"Error saving to database: {e}")
+        print(f"Error saving to Supabase: {e}")
         return False
 
 def list_user_files(bucket: str, user_id: str):
@@ -185,58 +167,59 @@ async def detect(req: DetectRequest):
 
     ingredients = [{'name': k, 'score': v} for k, v in sorted(result_map.items(), key=lambda x: -x[1])]
 
-    # Save to SQLite database
-    save_success = save_ingredients_to_db(user_id, ingredients)
+    # Save to Supabase detected_ingredients table
+    save_success = save_ingredients_to_supabase(user_id, ingredients, file_name)
     
     return {
         'file': file_name,
         'ingredients': ingredients,
-        'saved_to_db': save_success
+        'saved_to_supabase': save_success
     }
 
 @app.get('/user-ingredients/{user_id}')
 async def get_user_ingredients(user_id: str):
-    """Get all detected ingredients for a specific user"""
+    """Get all detected ingredients for a specific user from Supabase"""
     try:
-        conn = sqlite3.connect('food_nutrition.db')
-        cursor = conn.cursor()
-        cursor.execute(
-            'SELECT ingredients, detected_at FROM recipes WHERE user_id = ? ORDER BY detected_at DESC',
-            (user_id,)
-        )
-        results = cursor.fetchall()
-        conn.close()
+        response = supabase.table('detected_ingredients')\
+            .select('*')\
+            .eq('user_id', user_id)\
+            .order('detected_at', desc=True)\
+            .execute()
         
-        return [
-            {
-                'ingredients': json.loads(row[0]),
-                'detected_at': row[1]
-            }
-            for row in results
-        ]
+        if hasattr(response, 'error') and response.error:
+            raise Exception(response.error)
+            
+        results = response.data if hasattr(response, 'data') else []
+        
+        # Parse JSON ingredients back to objects
+        for result in results:
+            if 'ingredients' in result and isinstance(result['ingredients'], str):
+                result['ingredients'] = json.loads(result['ingredients'])
+                
+        return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Failed to fetch user ingredients: {e}')
 
 @app.get('/all-ingredients')
 async def get_all_ingredients():
-    """Get all detected ingredients from all users"""
+    """Get all detected ingredients from all users from Supabase"""
     try:
-        conn = sqlite3.connect('food_nutrition.db')
-        cursor = conn.cursor()
-        cursor.execute(
-            'SELECT user_id, ingredients, detected_at FROM recipes ORDER BY detected_at DESC'
-        )
-        results = cursor.fetchall()
-        conn.close()
+        response = supabase.table('detected_ingredients')\
+            .select('*')\
+            .order('detected_at', desc=True)\
+            .execute()
         
-        return [
-            {
-                'user_id': row[0],
-                'ingredients': json.loads(row[1]),
-                'detected_at': row[2]
-            }
-            for row in results
-        ]
+        if hasattr(response, 'error') and response.error:
+            raise Exception(response.error)
+            
+        results = response.data if hasattr(response, 'data') else []
+        
+        # Parse JSON ingredients back to objects
+        for result in results:
+            if 'ingredients' in result and isinstance(result['ingredients'], str):
+                result['ingredients'] = json.loads(result['ingredients'])
+                
+        return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Failed to fetch all ingredients: {e}')
 
