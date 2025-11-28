@@ -1,22 +1,3 @@
-"""
-FastAPI service for CV detection
-
-Endpoint: POST /detect
-Body: { "user_id": "<uid>", "bucket": "fridge-images" }
-
-Behavior:
-- list files in the specified bucket under the user's folder
-- pick the most recently created file
-- download the file bytes
-- run object detection (Faster R-CNN pretrained on COCO)
-- filter detections to common food classes and return list of ingredients
-
-Requires environment variables:
-- SUPABASE_URL
-- SUPABASE_KEY (service role key recommended)
-
-"""
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
@@ -30,6 +11,10 @@ import torch
 import torchvision.transforms as T
 from supabase import create_client, Client
 
+import sqlite3
+import json
+import uvicorn
+
 # Initialize Supabase client
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -40,6 +25,23 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="SmartPlate CV Service")
 
+# Initialize SQLite database
+def init_db():
+    conn = sqlite3.connect('food_nutrition.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS recipes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            ingredients TEXT NOT NULL,
+            detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Initialize database when app starts
+init_db()
 
 class DetectRequest(BaseModel):
     user_id: str
@@ -66,6 +68,25 @@ FOOD_CLASSES = set([
     'bottle', 'wine glass', 'cup', 'bowl', 'cake'
 ])
 
+def save_ingredients_to_db(user_id: str, ingredients: list):
+    """Save detected ingredients to SQLite database"""
+    try:
+        conn = sqlite3.connect('food_nutrition.db')
+        cursor = conn.cursor()
+        
+        # Convert ingredients list to JSON string
+        ingredients_json = json.dumps(ingredients)
+        
+        cursor.execute(
+            'INSERT INTO recipes (user_id, ingredients) VALUES (?, ?)',
+            (user_id, ingredients_json)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Error saving to database: {e}")
+        return False
 
 def list_user_files(bucket: str, user_id: str):
     """List files under a user's top-level folder. Returns list of file metadata dicts."""
@@ -133,6 +154,7 @@ async def detect(req: DetectRequest):
 
     # Load model (cache globally to avoid reloading on each request)
     if not hasattr(app.state, 'model'):
+        import torchvision
         model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
         model.eval()
         app.state.model = model
@@ -163,12 +185,60 @@ async def detect(req: DetectRequest):
 
     ingredients = [{'name': k, 'score': v} for k, v in sorted(result_map.items(), key=lambda x: -x[1])]
 
+    # Save to SQLite database
+    save_success = save_ingredients_to_db(user_id, ingredients)
+    
     return {
         'file': file_name,
-        'ingredients': ingredients
+        'ingredients': ingredients,
+        'saved_to_db': save_success
     }
 
+@app.get('/user-ingredients/{user_id}')
+async def get_user_ingredients(user_id: str):
+    """Get all detected ingredients for a specific user"""
+    try:
+        conn = sqlite3.connect('food_nutrition.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT ingredients, detected_at FROM recipes WHERE user_id = ? ORDER BY detected_at DESC',
+            (user_id,)
+        )
+        results = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                'ingredients': json.loads(row[0]),
+                'detected_at': row[1]
+            }
+            for row in results
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Failed to fetch user ingredients: {e}')
+
+@app.get('/all-ingredients')
+async def get_all_ingredients():
+    """Get all detected ingredients from all users"""
+    try:
+        conn = sqlite3.connect('food_nutrition.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT user_id, ingredients, detected_at FROM recipes ORDER BY detected_at DESC'
+        )
+        results = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                'user_id': row[0],
+                'ingredients': json.loads(row[1]),
+                'detected_at': row[2]
+            }
+            for row in results
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Failed to fetch all ingredients: {e}')
 
 if __name__ == '__main__':
-    import uvicorn
     uvicorn.run('cv:app', host='0.0.0.0', port=8001, reload=True)
