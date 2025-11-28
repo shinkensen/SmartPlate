@@ -20,4 +20,6 @@ Additional Tasks:
 2. Integrating into Frontend (Taking the image and sending it off to the api, then displaying and asking the user to review ingredients)- Siddharth Nittur
 3. Integrating into Frontend (Recipe recommendations & Progress tracking) - Govind Nair
 
-*/
+
+testing on mobile!
+*/ 
